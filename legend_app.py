@@ -6,7 +6,7 @@ from lmfit import Model
 import plotly.express as px
 import io
 
-st.title("LegendPlex Analyzer — R-equivalent 4PL/5PL fitting")
+st.title("LegendPlex Analyzer — R-equivalent 4PL/5PL Fitting")
 
 # ---------- 1. Upload & clean ----------
 uploaded = st.file_uploader("Upload FlowJo export (.csv or .xlsx)", type=["csv", "xlsx"])
@@ -28,13 +28,30 @@ if uploaded:
     st.success("✅ Columns cleaned successfully.")
     st.dataframe(df.head())
 
-    # ---------- 2. Standards detection ----------
-    std_detect_mode = st.radio("How to detect standards:", ["By label", "First N rows"])
-    if std_detect_mode == "By label":
-        std_rows = df[df["ID"].str.contains("Standard", case=False, na=False)].copy()
+    # ---------- 2. Detect standards robustly ----------
+    st.markdown("### Step 2: Detect Standards")
+
+    # Try automatic detection first
+    std_candidates = df[df["ID"].str.contains("Standard", case=False, na=False)]
+    if std_candidates.empty:
+        st.warning("⚠️ No 'Standard' found in ID column. Please select wells corresponding to standards.")
+        all_wells = df["ID"].tolist()
+        selected_wells = st.multiselect("Select wells that contain standards", options=all_wells)
+        std_rows = df[df["ID"].isin(selected_wells)].copy()
     else:
-        std_n = st.number_input("Number of standard rows", min_value=4, max_value=12, value=12, step=1)
-        std_rows = df.iloc[:int(std_n), :].copy()
+        std_rows = std_candidates.copy()
+
+    # Order correction
+    order_option = st.radio(
+        "Order of standards in file:",
+        ["Top row = highest concentration", "Top row = lowest concentration (blank first)"]
+    )
+
+    # Sort based on WELL ID number (extract digits)
+    std_rows = std_rows.sort_values(by="ID", key=lambda x: x.str.extract(r"(\d+)").astype(float))
+    if order_option == "Top row = lowest concentration (blank first)":
+        std_rows = std_rows.iloc[::-1].reset_index(drop=True)
+
     samples = df.loc[~df.index.isin(std_rows.index)].copy()
     st.info(f"Detected {len(std_rows)} standards and {len(samples)} samples.")
 
@@ -54,12 +71,14 @@ if uploaded:
     proceed = st.button("Run analysis")
 
     if proceed:
-        # ---------- 4. Prepare standard conc table (R parity) ----------
+        # ---------- 4. Prepare standard conc table ----------
         std_n = len(std_rows)
         powers = np.arange(std_n, dtype=float)
-        conc_pg = {a: (top_conc[a] * 1000) / (dilution_factor ** powers) for a in analytes}  # Top / 3^(i-1)
+        conc_pg = {a: (top_conc[a] * 1000) / (dilution_factor ** powers) for a in analytes}
         reps = pd.DataFrame(conc_pg)
         reps.insert(0, "ID", std_rows["ID"].values)
+        st.write("### Standard concentrations (pg/mL)")
+        st.dataframe(reps)
 
         # ---------- 5. QC ----------
         if df[analytes].isnull().any().any():
@@ -114,7 +133,7 @@ if uploaded:
                     params["s"].min = 0.5
                     params["s"].max = 2
 
-                result = model.fit(y, x=x, params=params)
+                result = model.fit(y, x=x, params=params, method="least_squares", max_nfev=10000)
                 y_fit = result.best_fit
                 r2 = 1 - np.sum((y - y_fit)**2) / np.sum((y - np.mean(y))**2)
 
