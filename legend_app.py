@@ -6,7 +6,7 @@ from lmfit import Model
 import plotly.express as px
 import io
 
-st.title("LegendPlex Analyzer — Robust 4PL/5PL (R-equivalent fitting)")
+st.title("LegendPlex Analyzer — R-equivalent 4PL/5PL Fitting")
 
 # ---------- 1. Upload & clean ----------
 uploaded = st.file_uploader("Upload FlowJo export (.csv or .xlsx)", type=["csv", "xlsx"])
@@ -28,12 +28,16 @@ if uploaded:
     st.success("✅ Columns cleaned successfully.")
     st.dataframe(df.head())
 
-    # ---------- 2. Detect standards ----------
-    std_rows = df[df["ID"].str.contains("Standard", case=False, na=False)]
-    if std_rows.empty:
-        st.error("⚠️ No standards detected. Make sure IDs contain 'Standard'.")
-        st.stop()
-    st.info(f"Detected {len(std_rows)} standards.")
+    # ---------- 2. Standards detection ----------
+    std_detect_mode = st.radio("How to detect standards:", ["By label", "First N rows"])
+    if std_detect_mode == "By label":
+        std_rows = df[df["ID"].str.contains("Standard", case=False, na=False)].copy()
+    else:
+        std_n = st.number_input("Number of standard rows", min_value=4, max_value=12, value=12, step=1)
+        std_rows = df.iloc[:int(std_n), :].copy()
+    samples = df.loc[~df.index.isin(std_rows.index)].copy()
+
+    st.info(f"Detected {len(std_rows)} standards and {len(samples)} samples.")
 
     # ---------- 3. User inputs ----------
     dilution_factor = st.number_input("Serial dilution factor (e.g., 3)", min_value=1.0, value=3.0)
@@ -42,19 +46,19 @@ if uploaded:
     top_conc = {a: st.number_input(f"{a}:", min_value=0.001, value=10.0) for a in analytes}
 
     st.markdown("### Assign dilution factors to sample IDs (optional)")
-    sample_ids = df.loc[~df["ID"].str.contains("Standard", case=False, na=False), "ID"].unique()
+    sample_ids = samples["ID"].unique()
     sample_dilutions = {sid: st.number_input(f"{sid} dilution factor:", min_value=1.0, value=1.0)
                         for sid in sample_ids}
 
+    apply_sample_dilution = st.checkbox("Apply dilution factors to final concentrations", value=False)
     fit_type = st.radio("Choose curve model:", ["4PL", "5PL"])
     proceed = st.button("Run analysis")
 
     if proceed:
-        # ---------- 4. Prepare standard conc table ----------
-        conc_pg = {a: [top_conc[a] * 1000] for a in analytes}
-        for _ in range(1, len(std_rows)):
-            for a in analytes:
-                conc_pg[a].append(conc_pg[a][-1] / dilution_factor)
+        # ---------- 4. Prepare standard conc table (R parity) ----------
+        std_n = len(std_rows)
+        powers = np.arange(std_n, dtype=float)
+        conc_pg = {a: (top_conc[a] * 1000) / (dilution_factor ** powers) for a in analytes}  # Top/3^(i-1)
         reps = pd.DataFrame(conc_pg)
         reps.insert(0, "ID", std_rows["ID"].values)
 
@@ -73,7 +77,6 @@ if uploaded:
 
         # ---------- 7. Fit curves & plot ----------
         fit_results, plots = {}, []
-        samples = df.loc[~df["ID"].str.contains("Standard", case=False, na=False)].copy()
 
         for a in analytes:
             try:
@@ -139,7 +142,9 @@ if uploaded:
                         A, B, EC50, n, s = popt["A"], popt["B"], popt["EC50"], popt["n"], popt["s"]
                         x_pred = EC50 + (1 / n) * np.log(((B - A)**(1/s))/((y_samples[mask_s] - A)**(1/s)) - 1)
                     conc_pred = 10 ** x_pred
-                    samples.loc[mask_s, f"{a}_conc_pgml"] = conc_pred * samples["ID"].map(sample_dilutions)
+                    if apply_sample_dilution:
+                        conc_pred = conc_pred * samples["ID"].map(sample_dilutions)
+                    samples.loc[mask_s, f"{a}_conc_pgml"] = conc_pred
                     fig.add_scatter(x=np.log10(conc_pred), y=y_samples[mask_s],
                                     mode="markers", name="Samples", marker=dict(color="blue", size=6))
                 except Exception:
@@ -178,7 +183,7 @@ if uploaded:
                     "Analyte": a,
                     "MFI": mfi,
                     "Concentration_pg_mL": conc,
-                    "Dilution_Factor": dilution
+                    "Dilution_Factor": dilution if apply_sample_dilution else 1
                 })
         long_df = pd.DataFrame(long_records)
         existing_cols = [col for col in samples.columns if col.endswith("_conc_pgml")]
