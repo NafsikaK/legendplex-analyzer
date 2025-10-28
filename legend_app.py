@@ -6,7 +6,7 @@ from lmfit import Model
 import plotly.express as px
 import io
 
-st.title("LegendPlex Analyzer — R-equivalent 4PL/5PL fitting")
+st.title("LegendPlex Analyzer — R-equivalent 4PL/5PL Fitting (Expert Version)")
 
 # ---------- 1. Upload & clean ----------
 uploaded = st.file_uploader("Upload FlowJo export (.csv or .xlsx)", type=["csv", "xlsx"])
@@ -18,7 +18,7 @@ def clean_colnames(df):
     df.columns = df.columns.astype(str)
     df.rename(columns={df.columns[0]: "ID"}, inplace=True)
     def extract_marker(c):
-        m = re.search(r".*?/(.*?)\s*\|", c)
+        m = re.search(r".*?/(.*?)\\s*\\|", c)
         return m.group(1).strip() if m else c
     df.columns = [extract_marker(c) for c in df.columns]
     return df
@@ -86,24 +86,26 @@ if uploaded:
 
         # ---------- 5. Define models ----------
         def fourPL(x, deltaA, log10EC50, n, Amin):
-            return Amin + (deltaA / (1 + np.exp(n * (x - log10EC50))))
+            x = np.clip(x, 1e-6, np.inf)  # avoid log10(0)
+            return Amin + (deltaA / (1 + np.exp(n * (np.log10(x) - log10EC50))))
 
         def fivePL(x, A, B, EC50, n, s):
-            return A + (B - A) / ((1 + np.exp(n * (x - EC50))) ** s)
+            x = np.clip(x, 1e-6, np.inf)
+            return A + (B - A) / ((1 + np.exp(n * (np.log10(x) - EC50))) ** s)
 
         # ---------- 6. Fit curves & plot ----------
         fit_results, plots = {}, []
 
         for a in analytes:
             try:
-                x = np.log10(reps[a].astype(float))
-                y = np.log10(std_rows[a].astype(float))  # log10(MFI) like in R
+                x = reps[a].astype(float)  # raw conc
+                y = np.log10(std_rows[a].astype(float))  # log10(MFI)
                 mask = np.isfinite(x) & np.isfinite(y)
                 x, y = x[mask], y[mask]
 
                 Amin_fixed = np.percentile(y, 5)
                 deltaA_start = np.percentile(y, 95) - Amin_fixed
-                log10EC50_start = np.median(x)
+                log10EC50_start = np.median(np.log10(x))
                 n_start = -1
 
                 if fit_type == "4PL":
@@ -115,6 +117,10 @@ if uploaded:
                         Amin=Amin_fixed
                     )
                     params["Amin"].vary = False
+                    params["deltaA"].min = 0
+                    params["deltaA"].max = 1e6
+                    params["log10EC50"].min = min(np.log10(x))
+                    params["log10EC50"].max = max(np.log10(x))
                     params["n"].min = -10
                     params["n"].max = -0.001
                 else:
@@ -122,32 +128,33 @@ if uploaded:
                     params = model.make_params(
                         A=min(y),
                         B=max(y),
-                        EC50=np.median(x),
+                        EC50=np.median(np.log10(x)),
                         n=-1,
                         s=1
                     )
                     params["A"].min = 0
+                    params["B"].max = 10
                     params["n"].max = -1e-3
                     params["s"].min = 0.5
                     params["s"].max = 2
 
-                result = model.fit(y, x=x, params=params, method="least_squares", max_nfev=10000)
+                result = model.fit(y, x=x, params=params, method="least_squares", max_nfev=20000)
                 y_fit = result.best_fit
                 r2 = 1 - np.sum((y - y_fit)**2) / np.sum((y - np.mean(y))**2)
                 fit_results[a] = {"result": result, "r2": r2, "Amin": Amin_fixed}
 
-                # Plot standard curve
-                x_fit = np.linspace(min(x), max(x), 100)
+                # Plot standards
+                x_fit = np.logspace(np.log10(min(x)), np.log10(max(x)), 100)
                 y_curve = model.eval(x=x_fit, **result.best_values)
                 fig = px.scatter(
-                    x=x, y=y, color_discrete_sequence=["red"],
+                    x=np.log10(x), y=y, color_discrete_sequence=["red"],
                     title=f"{a} — {fit_type} Fit (R²={r2:.3f})",
                     labels={"x": "log10(Concentration)", "y": "log10(MFI)"}
                 )
-                fig.add_scatter(x=x_fit, y=y_curve, mode="lines", name="Fit", line=dict(color="orange"))
+                fig.add_scatter(x=np.log10(x_fit), y=y_curve, mode="lines", name="Fit", line=dict(color="orange"))
 
                 # ---------- Interpolate samples ----------
-                y_samples = np.log10(samples[a].astype(float))  # log10(MFI)
+                y_samples = np.log10(samples[a].astype(float))
                 mask_s = np.isfinite(y_samples)
                 popt = result.best_values
                 try:
@@ -155,18 +162,17 @@ if uploaded:
                         deltaA, log10EC50, n = popt["deltaA"], popt["log10EC50"], popt["n"]
                         Amin = Amin_fixed
                         Amax = Amin + deltaA
-                        x_pred = (1 / n) * (
-                            np.log((Amax - y_samples[mask_s]) / (y_samples[mask_s] - Amin))
-                            + n * log10EC50
+                        # R's exact inverse
+                        x_pred = 10 ** (
+                            (1 / n) * (np.log((Amax - y_samples[mask_s]) / (y_samples[mask_s] - Amin)) + n * log10EC50)
                         )
                     else:
                         A, B, EC50, n, s = popt["A"], popt["B"], popt["EC50"], popt["n"], popt["s"]
-                        x_pred = (1 / n) * (
-                            np.log(((B - y_samples[mask_s]) / (y_samples[mask_s] - A)) ** (1/s))
-                            + n * EC50
+                        x_pred = 10 ** (
+                            (1 / n) * (np.log(((B - y_samples[mask_s]) / (y_samples[mask_s] - A)) ** (1/s)) + n * EC50)
                         )
 
-                    conc_pred = 10 ** x_pred
+                    conc_pred = x_pred
                     if apply_sample_dilution:
                         conc_pred = conc_pred * samples["ID"].map(sample_dilutions)
                     samples.loc[mask_s, f"{a}_conc_pgml"] = conc_pred
@@ -193,9 +199,7 @@ if uploaded:
             st.plotly_chart(fig, use_container_width=True)
 
         # ---------- 7. Export ----------
-        st.markdown("### Export results")
-        output_name = st.text_input("Output file name (no extension):", value="LegendPlex_results")
-
+        output_name = st.text_input("Output file name:", value="LegendPlex_results")
         qc_summary = pd.DataFrame([
             {"Analyte": a, "R²": fit_results[a]["r2"],
              "Fit_Status": "OK" if fit_results[a]["r2"] >= 0.95 else "Poor"}
@@ -205,17 +209,17 @@ if uploaded:
 
         long_records = []
         for _, row in samples.iterrows():
-            sample_id = row["ID"]
-            dilution = sample_dilutions.get(sample_id, 1)
+            sid = row["ID"]
+            dil = sample_dilutions.get(sid, 1)
             for a in analytes:
                 mfi = row[a]
                 conc = row.get(f"{a}_conc_pgml", np.nan)
                 long_records.append({
-                    "ID": sample_id,
+                    "ID": sid,
                     "Analyte": a,
                     "MFI": mfi,
                     "Concentration_pg_mL": conc,
-                    "Dilution_Factor": dilution if apply_sample_dilution else 1
+                    "Dilution_Factor": dil if apply_sample_dilution else 1
                 })
         long_df = pd.DataFrame(long_records)
         existing_cols = [col for col in samples.columns if col.endswith("_conc_pgml")]
@@ -229,7 +233,7 @@ if uploaded:
         output.seek(0)
 
         st.download_button(
-            label="⬇️ Download .xlsx file (with QC summary)",
+            label="⬇️ Download .xlsx (with QC summary)",
             data=output,
             file_name=f"{output_name}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
