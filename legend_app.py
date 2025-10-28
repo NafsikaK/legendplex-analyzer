@@ -77,6 +77,9 @@ if uploaded:
             try:
                 x = np.log10(reps[a].astype(float))
                 y = np.log10(std_rows[a].astype(float))
+                mask = np.isfinite(x) & np.isfinite(y)
+                x, y = x[mask], y[mask]
+
                 Amin_fixed = np.percentile(y, 5)
                 Amax_start = np.percentile(y, 95)
                 log10EC50_start = np.median(x)
@@ -84,18 +87,20 @@ if uploaded:
 
                 if fit_type == "4PL":
                     p0 = [Amax_start - Amin_fixed, log10EC50_start, n_start, Amin_fixed]
-                    popt, _ = curve_fit(fourPL, x, y, p0=p0, maxfev=20000)
+                    lower = [0, min(x), -10, -np.inf]
+                    upper = [np.inf, max(x), -1e-3, np.inf]
+                    popt, _ = curve_fit(
+                        fourPL, x, y, p0=p0, bounds=(lower, upper), maxfev=20000
+                    )
                     y_fit = fourPL(x, *popt)
                 else:
                     p0 = [min(y), max(y), np.median(x), -1, 1]
                     popt, _ = curve_fit(fivePL, x, y, p0=p0, maxfev=20000)
                     y_fit = fivePL(x, *popt)
 
-                # R²
                 r2 = 1 - np.sum((y - y_fit) ** 2) / np.sum((y - np.mean(y)) ** 2)
                 fit_results[a] = {"params": popt, "r2": r2, "Amin": Amin_fixed}
 
-                # Plot
                 x_fit = np.linspace(min(x), max(x), 100)
                 y_curve = fourPL(x_fit, *popt) if fit_type == "4PL" else fivePL(x_fit, *popt)
                 fig = px.scatter(x=x, y=y, title=f"{a} — {fit_type} Fit (R²={r2:.3f})",
@@ -118,14 +123,15 @@ if uploaded:
                 continue
             popt = fit_results[a]["params"]
             y = np.log10(samples[a].astype(float))
+            mask = np.isfinite(y)
             try:
                 if fit_type == "4PL":
                     deltaA, log10EC50, n, Amin = popt
-                    x_pred = log10EC50 + (1 / n) * np.log((deltaA / (y - Amin)) - 1)
+                    x_pred = log10EC50 + (1 / n) * np.log((deltaA / (y[mask] - Amin)) - 1)
                 else:
                     A, B, EC50, n, s = popt
-                    x_pred = EC50 + (1/n) * np.log(((B - A)**(1/s))/((y - A)**(1/s)) - 1)
-                samples[f"{a}_conc_pgml"] = 10 ** x_pred * samples["ID"].map(sample_dilutions)
+                    x_pred = EC50 + (1/n) * np.log(((B - A)**(1/s))/((y[mask] - A)**(1/s)) - 1)
+                samples.loc[mask, f"{a}_conc_pgml"] = 10 ** x_pred * samples["ID"].map(sample_dilutions)
             except Exception:
                 samples[f"{a}_conc_pgml"] = np.nan
 
@@ -148,7 +154,9 @@ if uploaded:
                     "Dilution_Factor": dilution
                 })
         long_df = pd.DataFrame(long_records)
-        wide_df = samples[["ID"] + [f"{a}_conc_pgml" for a in analytes]]
+
+        existing_cols = [col for col in samples.columns if col.endswith("_conc_pgml")]
+        wide_df = samples[["ID"] + existing_cols]
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
