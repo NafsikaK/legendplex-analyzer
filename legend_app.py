@@ -6,7 +6,7 @@ from lmfit import Model
 import plotly.express as px
 import io
 
-st.title("LegendPlex Analyzer — R-equivalent 4PL/5PL Fitting")
+st.title("LegendPlex Analyzer — R-equivalent 4PL/5PL fitting")
 
 # ---------- 1. Upload & clean ----------
 uploaded = st.file_uploader("Upload FlowJo export (.csv or .xlsx)", type=["csv", "xlsx"])
@@ -28,29 +28,26 @@ if uploaded:
     st.success("✅ Columns cleaned successfully.")
     st.dataframe(df.head())
 
-    # ---------- 2. Detect standards robustly ----------
+    # ---------- 2. Detect standards ----------
     st.markdown("### Step 2: Detect Standards")
 
-    # Try automatic detection first
     std_candidates = df[df["ID"].str.contains("Standard", case=False, na=False)]
     if std_candidates.empty:
-        st.warning("⚠️ No 'Standard' found in ID column. Please select wells corresponding to standards.")
+        st.warning("⚠️ No 'Standard' found in ID column. Select wells manually.")
         all_wells = df["ID"].tolist()
-        selected_wells = st.multiselect("Select wells that contain standards", options=all_wells)
+        selected_wells = st.multiselect("Select wells containing standards", options=all_wells)
         std_rows = df[df["ID"].isin(selected_wells)].copy()
     else:
         std_rows = std_candidates.copy()
 
-    # Order correction
     order_option = st.radio(
         "Order of standards in file:",
         ["Top row = highest concentration", "Top row = lowest concentration (blank first)"]
     )
 
-    # Sort based on WELL ID number (extract digits)
     std_rows = std_rows.sort_values(
-    by="ID",
-    key=lambda x: x.str.extract(r"(\d+)")[0].astype(float)
+        by="ID",
+        key=lambda x: pd.to_numeric(x.str.extract(r"(\\d+)")[0], errors="coerce")
     )
     if order_option == "Top row = lowest concentration (blank first)":
         std_rows = std_rows.iloc[::-1].reset_index(drop=True)
@@ -68,7 +65,6 @@ if uploaded:
     sample_ids = samples["ID"].unique()
     sample_dilutions = {sid: st.number_input(f"{sid} dilution factor:", min_value=1.0, value=1.0)
                         for sid in sample_ids}
-
     apply_sample_dilution = st.checkbox("Apply dilution factors to final concentrations", value=False)
     fit_type = st.radio("Choose curve model:", ["4PL", "5PL"])
     proceed = st.button("Run analysis")
@@ -83,26 +79,25 @@ if uploaded:
         st.write("### Standard concentrations (pg/mL)")
         st.dataframe(reps)
 
-        # ---------- 5. QC ----------
         if df[analytes].isnull().any().any():
             st.error("Missing or invalid MFI values detected.")
             st.stop()
         st.success("✅ Standard MFI values OK.")
 
-        # ---------- 6. Define models ----------
+        # ---------- 5. Define models ----------
         def fourPL(x, deltaA, log10EC50, n, Amin):
             return Amin + (deltaA / (1 + np.exp(n * (x - log10EC50))))
 
         def fivePL(x, A, B, EC50, n, s):
             return A + (B - A) / ((1 + np.exp(n * (x - EC50))) ** s)
 
-        # ---------- 7. Fit curves & plot ----------
+        # ---------- 6. Fit curves & plot ----------
         fit_results, plots = {}, []
 
         for a in analytes:
             try:
                 x = np.log10(reps[a].astype(float))
-                y = std_rows[a].astype(float)
+                y = np.log10(std_rows[a].astype(float))  # log10(MFI) like in R
                 mask = np.isfinite(x) & np.isfinite(y)
                 x, y = x[mask], y[mask]
 
@@ -139,7 +134,6 @@ if uploaded:
                 result = model.fit(y, x=x, params=params, method="least_squares", max_nfev=10000)
                 y_fit = result.best_fit
                 r2 = 1 - np.sum((y - y_fit)**2) / np.sum((y - np.mean(y))**2)
-
                 fit_results[a] = {"result": result, "r2": r2, "Amin": Amin_fixed}
 
                 # Plot standard curve
@@ -148,12 +142,12 @@ if uploaded:
                 fig = px.scatter(
                     x=x, y=y, color_discrete_sequence=["red"],
                     title=f"{a} — {fit_type} Fit (R²={r2:.3f})",
-                    labels={"x": "log10(Concentration)", "y": "MFI"}
+                    labels={"x": "log10(Concentration)", "y": "log10(MFI)"}
                 )
                 fig.add_scatter(x=x_fit, y=y_curve, mode="lines", name="Fit", line=dict(color="orange"))
 
-                # ---- Interpolate samples (exact R inverse) ----
-                y_samples = samples[a].astype(float)
+                # ---------- Interpolate samples ----------
+                y_samples = np.log10(samples[a].astype(float))  # log10(MFI)
                 mask_s = np.isfinite(y_samples)
                 popt = result.best_values
                 try:
@@ -177,7 +171,6 @@ if uploaded:
                         conc_pred = conc_pred * samples["ID"].map(sample_dilutions)
                     samples.loc[mask_s, f"{a}_conc_pgml"] = conc_pred
 
-                    # Add blue sample points
                     fig.add_scatter(
                         x=np.log10(conc_pred),
                         y=y_samples[mask_s],
@@ -199,7 +192,7 @@ if uploaded:
         for fig in plots:
             st.plotly_chart(fig, use_container_width=True)
 
-        # ---------- 8. Export ----------
+        # ---------- 7. Export ----------
         st.markdown("### Export results")
         output_name = st.text_input("Output file name (no extension):", value="LegendPlex_results")
 
@@ -243,4 +236,3 @@ if uploaded:
         )
 else:
     st.info("Please upload a FlowJo export to begin.")
-
