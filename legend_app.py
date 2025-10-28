@@ -48,7 +48,10 @@ if uploaded:
     )
 
     # Sort based on WELL ID number (extract digits)
-    std_rows = std_rows.sort_values(by="ID", key=lambda x: x.str.extract(r"(\d+)").astype(float))
+    std_rows = std_rows.sort_values(
+    by="ID",
+    key=lambda x: x.str.extract(r"(\d+)")[0].astype(float)
+    )
     if order_option == "Top row = lowest concentration (blank first)":
         std_rows = std_rows.iloc[::-1].reset_index(drop=True)
 
@@ -240,3 +243,4 @@ if uploaded:
         )
 else:
     st.info("Please upload a FlowJo export to begin.")
+
