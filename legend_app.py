@@ -1,14 +1,13 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re
+import re, io
 from lmfit import Model
 import plotly.express as px
-import io
 
-st.title("LegendPlex Analyzer — R-equivalent 4PL/5PL Fitting (Stable Build)")
+st.title("LegendPlex Analyzer — 4PL (R-equivalent)")
 
-# ---------- 1. Upload & clean ----------
+# ---------- Upload & clean ----------
 uploaded = st.file_uploader("Upload FlowJo export (.csv or .xlsx)", type=["csv", "xlsx"])
 
 def load_file(file):
@@ -17,238 +16,158 @@ def load_file(file):
 def clean_colnames(df):
     df.columns = df.columns.astype(str)
     df.rename(columns={df.columns[0]: "ID"}, inplace=True)
-
     def extract_marker(c):
         try:
             m = re.search(r".*?/(.*?)\s*\|", c)
             if m and m.group(1).strip():
                 return m.group(1).strip()
-            else:
-                parts = re.split(r"[/|]", c)
-                return parts[-2].strip() if len(parts) > 1 else c.strip()
+            parts = re.split(r"[/|]", c)
+            return parts[-2].strip() if len(parts) > 1 else c.strip()
         except Exception:
             return c.strip()
-
     df.columns = [extract_marker(c) for c in df.columns]
     return df
 
-if uploaded:
-    df = clean_colnames(load_file(uploaded))
-    st.success("✅ Columns cleaned successfully.")
-    st.dataframe(df.head())
+if not uploaded:
+    st.info("Upload a FlowJo export to begin.")
+    st.stop()
 
-    # ---------- 2. Detect standards ----------
-    st.markdown("### Step 2: Detect Standards")
+df = clean_colnames(load_file(uploaded))
+st.success("✅ Columns cleaned successfully.")
+st.dataframe(df.head())
 
-    std_candidates = df[df["ID"].str.contains("Standard", case=False, na=False)]
-    if std_candidates.empty:
-        st.warning("⚠️ No 'Standard' found in ID column. Select wells manually.")
-        all_wells = df["ID"].tolist()
-        selected_wells = st.multiselect("Select wells containing standards", options=all_wells)
-        std_rows = df[df["ID"].isin(selected_wells)].copy()
-    else:
-        std_rows = std_candidates.copy()
+# ---------- Detect standards ----------
+std_rows = df[df["ID"].str.contains("Standard", case=False, na=False)].copy()
+if std_rows.empty:
+    st.warning("⚠️ No standards detected automatically. Select wells manually.")
+    std_rows = df[df["ID"].isin(st.multiselect("Select wells with standards", df["ID"]))]
 
-    order_option = st.radio(
-        "Order of standards in file:",
-        ["Top row = highest concentration", "Top row = lowest concentration (blank first)"]
-    )
+samples = df.loc[~df.index.isin(std_rows.index)].copy()
+st.info(f"Detected {len(std_rows)} standards and {len(samples)} samples.")
 
-    std_rows = std_rows.sort_values(
-        by="ID",
-        key=lambda x: pd.to_numeric(x.str.extract(r"(\d+)")[0], errors="coerce")
-    )
-    if order_option == "Top row = lowest concentration (blank first)":
-        std_rows = std_rows.iloc[::-1].reset_index(drop=True)
+# ---------- User inputs ----------
+dilution_factor = st.number_input("Serial dilution factor (e.g., 3)", min_value=1.0, value=3.0)
+analytes = [c for c in df.columns if c not in ["ID", "WELL ID"]]
+st.markdown("### Enter top standard concentrations (from CoA, ng/mL)")
+top_conc = {a: st.number_input(f"{a}", min_value=0.001, value=10.0) for a in analytes}
+apply_dilution = st.checkbox("Apply sample dilution factors?", value=False)
+fit_button = st.button("Run R-equivalent 4PL fit")
 
-    samples = df.loc[~df.index.isin(std_rows.index)].copy()
-    st.info(f"Detected {len(std_rows)} standards and {len(samples)} samples.")
+# ---------- 4PL R-equivalent model ----------
+def fourPL_R(Concentration, deltaA, log10EC50, n, Amin_fixed):
+    return Amin_fixed + (deltaA / (1 + np.exp(n * (Concentration - log10EC50))))
 
-    # ---------- 3. User inputs ----------
-    dilution_factor = st.number_input("Serial dilution factor (e.g., 3)", min_value=1.0, value=3.0)
-    analytes = [c for c in df.columns if c not in ["ID", "WELL ID"]]
-    st.markdown("### Enter top standard concentrations (from CoA, ng/mL)")
-    top_conc = {a: st.number_input(f"{a}:", min_value=0.001, value=10.0) for a in analytes}
+def inverse_fourPL_R(MFI, Amin_fixed, deltaA, log10EC50, n):
+    Amax = Amin_fixed + deltaA
+    return (1/n) * (np.log((Amax - MFI) / (MFI - Amin_fixed)) + n * log10EC50)
 
-    st.markdown("### Assign dilution factors to sample IDs (optional)")
-    sample_ids = samples["ID"].unique()
-    sample_dilutions = {sid: st.number_input(f"{sid} dilution factor:", min_value=1.0, value=1.0)
-                        for sid in sample_ids}
-    apply_sample_dilution = st.checkbox("Apply dilution factors to final concentrations", value=False)
-    fit_type = st.radio("Choose curve model:", ["4PL", "5PL"])
-    show_params = st.checkbox("Show fitted parameter values per analyte", value=False)
-    proceed = st.button("Run analysis")
+if not fit_button:
+    st.stop()
 
-    if proceed:
-        # ---------- 4. Prepare standard conc table ----------
-        std_n = len(std_rows)
-        powers = np.arange(std_n, dtype=float)
-        conc_pg = {a: (top_conc[a] * 1000) / (dilution_factor ** powers) for a in analytes}
-        reps = pd.DataFrame(conc_pg)
-        reps.insert(0, "ID", std_rows["ID"].values)
-        st.write("### Standard concentrations (pg/mL)")
-        st.dataframe(reps)
+# ---------- Build concentration ladder ----------
+std_n = len(std_rows)
+powers = np.arange(std_n, dtype=float)
+conc_pg = {a: (top_conc[a]*1000) / (dilution_factor ** powers) for a in analytes}
+reps = pd.DataFrame(conc_pg)
+reps.insert(0, "ID", std_rows["ID"].values)
+st.dataframe(reps.head())
 
-        if df[analytes].isnull().any().any():
-            st.error("Missing or invalid MFI values detected.")
-            st.stop()
-        st.success("✅ Standard MFI values OK.")
+# ---------- Fit ----------
+fit_results = {}
+plots = []
+out_long = []
 
-        # ---------- 5. Define models ----------
-        def fourPL(x, deltaA, log10EC50, n, Amin):
-            x = np.clip(x, 1e-6, np.inf)
-            return Amin + (deltaA / (1 + np.exp(n * (np.log10(x) - log10EC50))))
+for a in analytes:
+    try:
+        # log10 transform for both concentration and MFI
+        x = np.log10(np.asarray(reps[a], dtype=float))
+        y = np.log10(np.asarray(std_rows[a], dtype=float))
 
-        def fivePL(x, A, B, EC50, n, s):
-            x = np.clip(x, 1e-6, np.inf)
-            return A + (B - A) / ((1 + np.exp(n * (np.log10(x) - EC50))) ** s)
+        # drop non-finite
+        mask = np.isfinite(x) & np.isfinite(y)
+        x, y = x[mask], y[mask]
 
-        # ---------- 6. Fit curves & plot ----------
-        fit_results, plots = {}, []
+        # Amin fixed
+        Amin_fixed = np.quantile(y, 0.05)
+        Amax_start = np.quantile(y, 0.95)
+        mid_y = (Amax_start + Amin_fixed) / 2
+        mid_row = y[np.argmin(np.abs(y - mid_y))]
+        log10EC50_start = x[list(y).index(mid_row)] if len(y)>1 else np.median(x)
+        n_start = -1
 
-        for a in analytes:
-            try:
-                x = reps[a].astype(float)
-                y = np.log10(std_rows[a].astype(float))  # log10(MFI)
-                mask = np.isfinite(x) & np.isfinite(y)
-                x, y = x[mask], y[mask]
-
-                Amin_fixed = np.percentile(y, 5)
-                deltaA_start = np.percentile(y, 95) - Amin_fixed
-                log10EC50_start = np.median(np.log10(x))
-                n_start = -1
-
-                if fit_type == "4PL":
-                    model = Model(fourPL)
-                    params = model.make_params(
-                        deltaA=deltaA_start,
-                        log10EC50=log10EC50_start,
-                        n=n_start,
-                        Amin=Amin_fixed
-                    )
-                    params["Amin"].vary = False
-                    params["deltaA"].min = 0
-                    params["deltaA"].max = 1e6
-                    params["log10EC50"].min = min(np.log10(x))
-                    params["log10EC50"].max = max(np.log10(x))
-                    params["n"].min = -10
-                    params["n"].max = -0.001
-                else:
-                    model = Model(fivePL)
-                    params = model.make_params(
-                        A=min(y),
-                        B=max(y),
-                        EC50=np.median(np.log10(x)),
-                        n=-1,
-                        s=1
-                    )
-                    params["A"].min = 0
-                    params["B"].max = 10
-                    params["n"].max = -1e-3
-                    params["s"].min = 0.5
-                    params["s"].max = 2
-
-                result = model.fit(y, x=x, params=params, method="least_squares", max_nfev=20000)
-                y_fit = result.best_fit
-                r2 = 1 - np.sum((y - y_fit)**2) / np.sum((y - np.mean(y))**2)
-                fit_results[a] = {"result": result, "r2": r2, "Amin": Amin_fixed}
-
-                if show_params:
-                    st.write(f"**{a} parameters:**", result.best_values)
-
-                # Plot standards
-                x_fit = np.logspace(np.log10(min(x)), np.log10(max(x)), 100)
-                y_curve = model.eval(x=x_fit, **result.best_values)
-                fig = px.scatter(
-                    x=np.log10(x), y=y, color_discrete_sequence=["red"],
-                    title=f"{a} — {fit_type} Fit (R²={r2:.3f})",
-                    labels={"x": "log10(Concentration)", "y": "log10(MFI)"}
-                )
-                fig.add_scatter(x=np.log10(x_fit), y=y_curve, mode="lines", name="Fit", line=dict(color="orange"))
-
-                # ---------- Interpolate samples ----------
-                y_samples = np.log10(samples[a].astype(float))
-                mask_s = np.isfinite(y_samples)
-                popt = result.best_values
-                try:
-                    if fit_type == "4PL":
-                        deltaA, log10EC50, n = popt["deltaA"], popt["log10EC50"], popt["n"]
-                        Amin = Amin_fixed
-                        Amax = Amin + deltaA
-                        x_pred = 10 ** (
-                            (1 / n) * (np.log((Amax - y_samples[mask_s]) / (y_samples[mask_s] - Amin)) + n * log10EC50)
-                        )
-                    else:
-                        A, B, EC50, n, s = popt["A"], popt["B"], popt["EC50"], popt["n"], popt["s"]
-                        x_pred = 10 ** (
-                            (1 / n) * (np.log(((B - y_samples[mask_s]) / (y_samples[mask_s] - A)) ** (1/s)) + n * EC50)
-                        )
-
-                    conc_pred = x_pred
-                    if apply_sample_dilution:
-                        conc_pred = conc_pred * samples["ID"].map(sample_dilutions)
-                    samples.loc[mask_s, f"{a}_conc_pgml"] = conc_pred
-
-                    fig.add_scatter(
-                        x=np.log10(conc_pred),
-                        y=y_samples[mask_s],
-                        mode="markers",
-                        name="Samples",
-                        marker=dict(color="blue", size=6)
-                    )
-                except Exception as e:
-                    samples[f"{a}_conc_pgml"] = np.nan
-                    st.warning(f"⚠️ Interpolation failed for {a}: {e}")
-
-                if r2 < 0.95:
-                    st.warning(f"⚠️ {a}: R²={r2:.3f}, curve may be poor.")
-                plots.append(fig)
-            except Exception as e:
-                st.warning(f"⚠️ Fit failed for {a}: {e}")
-
-        st.success("✅ Curve fitting complete.")
-        for fig in plots:
-            st.plotly_chart(fig, use_container_width=True)
-
-        # ---------- 7. Export ----------
-        output_name = st.text_input("Output file name:", value="LegendPlex_results")
-        qc_summary = pd.DataFrame([
-            {"Analyte": a, "R²": fit_results[a]["r2"],
-             "Fit_Status": "OK" if fit_results[a]["r2"] >= 0.95 else "Poor"}
-            for a in fit_results
-        ])
-        st.dataframe(qc_summary)
-
-        long_records = []
-        for _, row in samples.iterrows():
-            sid = row["ID"]
-            dil = sample_dilutions.get(sid, 1)
-            for a in analytes:
-                mfi = row[a]
-                conc = row.get(f"{a}_conc_pgml", np.nan)
-                long_records.append({
-                    "ID": sid,
-                    "Analyte": a,
-                    "MFI": mfi,
-                    "Concentration_pg_mL": conc,
-                    "Dilution_Factor": dil if apply_sample_dilution else 1
-                })
-        long_df = pd.DataFrame(long_records)
-        existing_cols = [col for col in samples.columns if col.endswith("_conc_pgml")]
-        wide_df = samples[["ID"] + existing_cols]
-
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            long_df.to_excel(writer, index=False, sheet_name="Long_Format")
-            wide_df.to_excel(writer, index=False, sheet_name="Wide_Format")
-            qc_summary.to_excel(writer, index=False, sheet_name="QC_Summary")
-        output.seek(0)
-
-        st.download_button(
-            label="⬇️ Download .xlsx (with QC summary)",
-            data=output,
-            file_name=f"{output_name}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        model = Model(fourPL_R)
+        params = model.make_params(
+            deltaA=Amax_start - Amin_fixed,
+            log10EC50=log10EC50_start,
+            n=n_start,
+            Amin_fixed=Amin_fixed
         )
-else:
-    st.info("Please upload a FlowJo export to begin.")
+        params["Amin_fixed"].vary = False
+        params["deltaA"].min, params["deltaA"].max = 1e-6, (Amax_start - Amin_fixed)*5
+        params["log10EC50"].min, params["log10EC50"].max = min(x), max(x)
+        params["n"].min, params["n"].max = -10, -1e-3
+
+        result = model.fit(y, Concentration=x, params=params,
+                           method="leastsq", max_nfev=20000)
+        y_fit = result.best_fit
+        r2 = 1 - np.sum((y - y_fit)**2)/np.sum((y - np.mean(y))**2)
+        fit_results[a] = {"result": result, "Amin": Amin_fixed, "r2": r2}
+
+        # ---------- Plot ----------
+        x_fit = np.linspace(min(x), max(x), 200)
+        y_curve = model.eval(Concentration=x_fit, **result.best_values)
+        fig = px.scatter(x=x, y=y, title=f"{a} — 4PL (R²={r2:.3f})",
+                         labels={"x": "log10(Concentration)", "y": "log10(MFI)"},
+                         color_discrete_sequence=["red"])
+        fig.add_scatter(x=x_fit, y=y_curve, mode="lines", name="Fit", line=dict(color="orange"))
+
+        # ---------- Interpolate samples ----------
+        y_samples = np.log10(np.asarray(samples[a], dtype=float))
+        mask_s = np.isfinite(y_samples)
+        p = result.best_values
+        x_pred = inverse_fourPL_R(y_samples[mask_s],
+                                  Amin_fixed,
+                                  p["deltaA"],
+                                  p["log10EC50"],
+                                  p["n"])
+        conc_pred = 10 ** x_pred
+        samples.loc[mask_s, f"{a}_conc_pgml"] = conc_pred
+
+        fig.add_scatter(
+            x=x_pred,
+            y=y_samples[mask_s],
+            mode="markers",
+            name="Samples",
+            marker=dict(color="blue", size=6)
+        )
+        plots.append(fig)
+
+        # ---------- Store results ----------
+        for sid, mfi_val, cval in zip(samples["ID"], samples[a], samples[f"{a}_conc_pgml"]):
+            out_long.append({"ID": sid, "Analyte": a, "MFI": mfi_val, "Conc_pg/mL": cval})
+    except Exception as e:
+        st.warning(f"⚠️ Fit failed for {a}: {e}")
+
+# ---------- Display ----------
+st.success("✅ Fits complete. Below are your curves:")
+for fig in plots:
+    st.plotly_chart(fig, use_container_width=True)
+
+# ---------- Export ----------
+qc = pd.DataFrame([{"Analyte": a, "R²": fit_results[a]["r2"]} for a in fit_results])
+long_df = pd.DataFrame(out_long)
+wide_df = long_df.pivot_table(index="ID", columns="Analyte", values="Conc_pg/mL", aggfunc="first").reset_index()
+
+output = io.BytesIO()
+with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    long_df.to_excel(writer, index=False, sheet_name="Long")
+    wide_df.to_excel(writer, index=False, sheet_name="Wide")
+    qc.to_excel(writer, index=False, sheet_name="QC")
+output.seek(0)
+
+st.download_button(
+    label="⬇️ Download results (.xlsx)",
+    data=output,
+    file_name="LegendPlex_results.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
