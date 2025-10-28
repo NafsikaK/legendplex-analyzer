@@ -6,7 +6,7 @@ from lmfit import Model
 import plotly.express as px
 import io
 
-st.title("LegendPlex Analyzer — R-equivalent 4PL/5PL Fitting (Expert Version)")
+st.title("LegendPlex Analyzer — R-equivalent 4PL/5PL Fitting (Stable Build)")
 
 # ---------- 1. Upload & clean ----------
 uploaded = st.file_uploader("Upload FlowJo export (.csv or .xlsx)", type=["csv", "xlsx"])
@@ -17,9 +17,18 @@ def load_file(file):
 def clean_colnames(df):
     df.columns = df.columns.astype(str)
     df.rename(columns={df.columns[0]: "ID"}, inplace=True)
+
     def extract_marker(c):
-        m = re.search(r".*?/(.*?)\\s*\\|", c)
-        return m.group(1).strip() if m else c
+        try:
+            m = re.search(r".*?/(.*?)\s*\|", c)
+            if m and m.group(1).strip():
+                return m.group(1).strip()
+            else:
+                parts = re.split(r"[/|]", c)
+                return parts[-2].strip() if len(parts) > 1 else c.strip()
+        except Exception:
+            return c.strip()
+
     df.columns = [extract_marker(c) for c in df.columns]
     return df
 
@@ -47,7 +56,7 @@ if uploaded:
 
     std_rows = std_rows.sort_values(
         by="ID",
-        key=lambda x: pd.to_numeric(x.str.extract(r"(\\d+)")[0], errors="coerce")
+        key=lambda x: pd.to_numeric(x.str.extract(r"(\d+)")[0], errors="coerce")
     )
     if order_option == "Top row = lowest concentration (blank first)":
         std_rows = std_rows.iloc[::-1].reset_index(drop=True)
@@ -67,6 +76,7 @@ if uploaded:
                         for sid in sample_ids}
     apply_sample_dilution = st.checkbox("Apply dilution factors to final concentrations", value=False)
     fit_type = st.radio("Choose curve model:", ["4PL", "5PL"])
+    show_params = st.checkbox("Show fitted parameter values per analyte", value=False)
     proceed = st.button("Run analysis")
 
     if proceed:
@@ -86,7 +96,7 @@ if uploaded:
 
         # ---------- 5. Define models ----------
         def fourPL(x, deltaA, log10EC50, n, Amin):
-            x = np.clip(x, 1e-6, np.inf)  # avoid log10(0)
+            x = np.clip(x, 1e-6, np.inf)
             return Amin + (deltaA / (1 + np.exp(n * (np.log10(x) - log10EC50))))
 
         def fivePL(x, A, B, EC50, n, s):
@@ -98,7 +108,7 @@ if uploaded:
 
         for a in analytes:
             try:
-                x = reps[a].astype(float)  # raw conc
+                x = reps[a].astype(float)
                 y = np.log10(std_rows[a].astype(float))  # log10(MFI)
                 mask = np.isfinite(x) & np.isfinite(y)
                 x, y = x[mask], y[mask]
@@ -143,6 +153,9 @@ if uploaded:
                 r2 = 1 - np.sum((y - y_fit)**2) / np.sum((y - np.mean(y))**2)
                 fit_results[a] = {"result": result, "r2": r2, "Amin": Amin_fixed}
 
+                if show_params:
+                    st.write(f"**{a} parameters:**", result.best_values)
+
                 # Plot standards
                 x_fit = np.logspace(np.log10(min(x)), np.log10(max(x)), 100)
                 y_curve = model.eval(x=x_fit, **result.best_values)
@@ -162,7 +175,6 @@ if uploaded:
                         deltaA, log10EC50, n = popt["deltaA"], popt["log10EC50"], popt["n"]
                         Amin = Amin_fixed
                         Amax = Amin + deltaA
-                        # R's exact inverse
                         x_pred = 10 ** (
                             (1 / n) * (np.log((Amax - y_samples[mask_s]) / (y_samples[mask_s] - Amin)) + n * log10EC50)
                         )
