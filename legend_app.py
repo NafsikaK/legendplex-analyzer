@@ -65,8 +65,9 @@ if uploaded:
         st.success("✅ Standard MFI values OK.")
 
         # ---------- 6. Define models ----------
-        def fourPL(x, A, B, EC50, n):
-            return A + (B - A) / (1 + np.exp(n * (x - EC50)))
+        def fourPL(x, deltaA, log10EC50, n, Amin):
+            return Amin + (deltaA / (1 + np.exp(n * (x - log10EC50))))
+
         def fivePL(x, A, B, EC50, n, s):
             return A + (B - A) / ((1 + np.exp(n * (x - EC50))) ** s)
 
@@ -76,22 +77,29 @@ if uploaded:
             try:
                 x = np.log10(reps[a].astype(float))
                 y = np.log10(std_rows[a].astype(float))
+                Amin_fixed = np.percentile(y, 5)
+                Amax_start = np.percentile(y, 95)
+                log10EC50_start = np.median(x)
+                n_start = -1
+
                 if fit_type == "4PL":
-                    popt, _ = curve_fit(fourPL, x, y, maxfev=10000)
+                    p0 = [Amax_start - Amin_fixed, log10EC50_start, n_start, Amin_fixed]
+                    popt, _ = curve_fit(fourPL, x, y, p0=p0, maxfev=20000)
                     y_fit = fourPL(x, *popt)
                 else:
-                    popt, _ = curve_fit(fivePL, x, y, p0=[min(y), max(y), np.median(x), -1, 1], maxfev=10000)
+                    p0 = [min(y), max(y), np.median(x), -1, 1]
+                    popt, _ = curve_fit(fivePL, x, y, p0=p0, maxfev=20000)
                     y_fit = fivePL(x, *popt)
 
                 # R²
-                r2 = 1 - np.sum((y - y_fit)**2) / np.sum((y - np.mean(y))**2)
-                fit_results[a] = {"params": popt, "r2": r2}
+                r2 = 1 - np.sum((y - y_fit) ** 2) / np.sum((y - np.mean(y)) ** 2)
+                fit_results[a] = {"params": popt, "r2": r2, "Amin": Amin_fixed}
 
                 # Plot
                 x_fit = np.linspace(min(x), max(x), 100)
                 y_curve = fourPL(x_fit, *popt) if fit_type == "4PL" else fivePL(x_fit, *popt)
                 fig = px.scatter(x=x, y=y, title=f"{a} — {fit_type} Fit (R²={r2:.3f})",
-                                 labels={"x": "log10(Conc)", "y": "log10(MFI)"})
+                                 labels={"x": "log10(Concentration)", "y": "log10(MFI)"})
                 fig.add_scatter(x=x_fit, y=y_curve, mode="lines", name="Fit", line=dict(color="orange"))
                 if r2 < 0.95:
                     st.warning(f"⚠️ {a}: R²={r2:.3f}, curve may be poor.")
@@ -112,8 +120,8 @@ if uploaded:
             y = np.log10(samples[a].astype(float))
             try:
                 if fit_type == "4PL":
-                    A, B, EC50, n = popt
-                    x_pred = EC50 + (1/n) * np.log((B - A)/(y - A) - 1)
+                    deltaA, log10EC50, n, Amin = popt
+                    x_pred = log10EC50 + (1 / n) * np.log((deltaA / (y - Amin)) - 1)
                 else:
                     A, B, EC50, n, s = popt
                     x_pred = EC50 + (1/n) * np.log(((B - A)**(1/s))/((y - A)**(1/s)) - 1)
@@ -125,8 +133,22 @@ if uploaded:
         st.markdown("### Export results")
         output_name = st.text_input("Output file name (no extension):", value="LegendPlex_results")
 
-        long_df = samples.melt(id_vars=["ID"], var_name="Analyte_or_MFI", value_name="Value")
-        wide_df = samples.copy()
+        long_records = []
+        for _, row in samples.iterrows():
+            sample_id = row["ID"]
+            dilution = sample_dilutions.get(sample_id, 1)
+            for a in analytes:
+                mfi = row[a]
+                conc = row.get(f"{a}_conc_pgml", np.nan)
+                long_records.append({
+                    "ID": sample_id,
+                    "Analyte": a,
+                    "MFI": mfi,
+                    "Concentration_pg_mL": conc,
+                    "Dilution_Factor": dilution
+                })
+        long_df = pd.DataFrame(long_records)
+        wide_df = samples[["ID"] + [f"{a}_conc_pgml" for a in analytes]]
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
