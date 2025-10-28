@@ -6,7 +6,7 @@ from lmfit import Model
 import plotly.express as px
 import io
 
-st.title("LegendPlex Analyzer — R-equivalent 4PL/5PL Fitting")
+st.title("LegendPlex Analyzer — R-equivalent 4PL/5PL fitting")
 
 # ---------- 1. Upload & clean ----------
 uploaded = st.file_uploader("Upload FlowJo export (.csv or .xlsx)", type=["csv", "xlsx"])
@@ -36,7 +36,6 @@ if uploaded:
         std_n = st.number_input("Number of standard rows", min_value=4, max_value=12, value=12, step=1)
         std_rows = df.iloc[:int(std_n), :].copy()
     samples = df.loc[~df.index.isin(std_rows.index)].copy()
-
     st.info(f"Detected {len(std_rows)} standards and {len(samples)} samples.")
 
     # ---------- 3. User inputs ----------
@@ -58,7 +57,7 @@ if uploaded:
         # ---------- 4. Prepare standard conc table (R parity) ----------
         std_n = len(std_rows)
         powers = np.arange(std_n, dtype=float)
-        conc_pg = {a: (top_conc[a] * 1000) / (dilution_factor ** powers) for a in analytes}  # Top/3^(i-1)
+        conc_pg = {a: (top_conc[a] * 1000) / (dilution_factor ** powers) for a in analytes}  # Top / 3^(i-1)
         reps = pd.DataFrame(conc_pg)
         reps.insert(0, "ID", std_rows["ID"].values)
 
@@ -75,111 +74,108 @@ if uploaded:
         def fivePL(x, A, B, EC50, n, s):
             return A + (B - A) / ((1 + np.exp(n * (x - EC50))) ** s)
 
-# ---------- 7. Fit curves & plot ----------
-fit_results, plots = {}, []
+        # ---------- 7. Fit curves & plot ----------
+        fit_results, plots = {}, []
 
-for a in analytes:
-    try:
-        x = np.log10(reps[a].astype(float))
-        y = std_rows[a].astype(float)
-        mask = np.isfinite(x) & np.isfinite(y)
-        x, y = x[mask], y[mask]
+        for a in analytes:
+            try:
+                x = np.log10(reps[a].astype(float))
+                y = std_rows[a].astype(float)
+                mask = np.isfinite(x) & np.isfinite(y)
+                x, y = x[mask], y[mask]
 
-        Amin_fixed = np.percentile(y, 5)
-        deltaA_start = np.percentile(y, 95) - Amin_fixed
-        log10EC50_start = np.median(x)
-        n_start = -1
+                Amin_fixed = np.percentile(y, 5)
+                deltaA_start = np.percentile(y, 95) - Amin_fixed
+                log10EC50_start = np.median(x)
+                n_start = -1
 
-        if fit_type == "4PL":
-            model = Model(fourPL)
-            params = model.make_params(
-                deltaA=deltaA_start,
-                log10EC50=log10EC50_start,
-                n=n_start,
-                Amin=Amin_fixed
-            )
-            params["Amin"].vary = False
-            params["n"].min = -10
-            params["n"].max = -0.001
-        else:
-            model = Model(fivePL)
-            params = model.make_params(
-                A=min(y),
-                B=max(y),
-                EC50=np.median(x),
-                n=-1,
-                s=1
-            )
-            params["A"].min = 0
-            params["n"].max = -1e-3
-            params["s"].min = 0.5
-            params["s"].max = 2
+                if fit_type == "4PL":
+                    model = Model(fourPL)
+                    params = model.make_params(
+                        deltaA=deltaA_start,
+                        log10EC50=log10EC50_start,
+                        n=n_start,
+                        Amin=Amin_fixed
+                    )
+                    params["Amin"].vary = False
+                    params["n"].min = -10
+                    params["n"].max = -0.001
+                else:
+                    model = Model(fivePL)
+                    params = model.make_params(
+                        A=min(y),
+                        B=max(y),
+                        EC50=np.median(x),
+                        n=-1,
+                        s=1
+                    )
+                    params["A"].min = 0
+                    params["n"].max = -1e-3
+                    params["s"].min = 0.5
+                    params["s"].max = 2
 
-        result = model.fit(y, x=x, params=params)
-        y_fit = result.best_fit
-        r2 = 1 - np.sum((y - y_fit)**2) / np.sum((y - np.mean(y))**2)
+                result = model.fit(y, x=x, params=params)
+                y_fit = result.best_fit
+                r2 = 1 - np.sum((y - y_fit)**2) / np.sum((y - np.mean(y))**2)
 
-        fit_results[a] = {"result": result, "r2": r2, "Amin": Amin_fixed}
+                fit_results[a] = {"result": result, "r2": r2, "Amin": Amin_fixed}
 
-        # Plot standard curve
-        x_fit = np.linspace(min(x), max(x), 100)
-        y_curve = model.eval(x=x_fit, **result.best_values)
-        fig = px.scatter(
-            x=x,
-            y=y,
-            color_discrete_sequence=["red"],
-            title=f"{a} — {fit_type} Fit (R²={r2:.3f})",
-            labels={"x": "log10(Concentration)", "y": "MFI"}
-        )
-        fig.add_scatter(x=x_fit, y=y_curve, mode="lines", name="Fit", line=dict(color="orange"))
-
-        # ---- Interpolate samples (exact R inverse) ----
-        y_samples = samples[a].astype(float)
-        mask_s = np.isfinite(y_samples)
-        popt = result.best_values
-        try:
-            if fit_type == "4PL":
-                deltaA, log10EC50, n = popt["deltaA"], popt["log10EC50"], popt["n"]
-                Amin = Amin_fixed
-                Amax = Amin + deltaA
-                # R formula: (1/n)*(ln((Amax - A)/(A - Amin)) + n*log10EC50)
-                x_pred = (1 / n) * (
-                    np.log((Amax - y_samples[mask_s]) / (y_samples[mask_s] - Amin))
-                    + n * log10EC50
+                # Plot standard curve
+                x_fit = np.linspace(min(x), max(x), 100)
+                y_curve = model.eval(x=x_fit, **result.best_values)
+                fig = px.scatter(
+                    x=x, y=y, color_discrete_sequence=["red"],
+                    title=f"{a} — {fit_type} Fit (R²={r2:.3f})",
+                    labels={"x": "log10(Concentration)", "y": "MFI"}
                 )
-            else:
-                A, B, EC50, n, s = popt["A"], popt["B"], popt["EC50"], popt["n"], popt["s"]
-                x_pred = (1 / n) * (
-                    np.log(((B - y_samples[mask_s]) / (y_samples[mask_s] - A)) ** (1/s))
-                    + n * EC50
-                )
+                fig.add_scatter(x=x_fit, y=y_curve, mode="lines", name="Fit", line=dict(color="orange"))
 
-            conc_pred = 10 ** x_pred
-            if apply_sample_dilution:
-                conc_pred = conc_pred * samples["ID"].map(sample_dilutions)
-            samples.loc[mask_s, f"{a}_conc_pgml"] = conc_pred
+                # ---- Interpolate samples (exact R inverse) ----
+                y_samples = samples[a].astype(float)
+                mask_s = np.isfinite(y_samples)
+                popt = result.best_values
+                try:
+                    if fit_type == "4PL":
+                        deltaA, log10EC50, n = popt["deltaA"], popt["log10EC50"], popt["n"]
+                        Amin = Amin_fixed
+                        Amax = Amin + deltaA
+                        x_pred = (1 / n) * (
+                            np.log((Amax - y_samples[mask_s]) / (y_samples[mask_s] - Amin))
+                            + n * log10EC50
+                        )
+                    else:
+                        A, B, EC50, n, s = popt["A"], popt["B"], popt["EC50"], popt["n"], popt["s"]
+                        x_pred = (1 / n) * (
+                            np.log(((B - y_samples[mask_s]) / (y_samples[mask_s] - A)) ** (1/s))
+                            + n * EC50
+                        )
 
-            # Add blue sample points
-            fig.add_scatter(
-                x=np.log10(conc_pred),
-                y=y_samples[mask_s],
-                mode="markers",
-                name="Samples",
-                marker=dict(color="blue", size=6)
-            )
-        except Exception as e:
-            samples[f"{a}_conc_pgml"] = np.nan
-            st.warning(f"⚠️ Interpolation failed for {a}: {e}")
+                    conc_pred = 10 ** x_pred
+                    if apply_sample_dilution:
+                        conc_pred = conc_pred * samples["ID"].map(sample_dilutions)
+                    samples.loc[mask_s, f"{a}_conc_pgml"] = conc_pred
 
-        if r2 < 0.95:
-            st.warning(f"⚠️ {a}: R²={r2:.3f}, curve may be poor.")
-        plots.append(fig)
-    except Exception as e:
-        st.warning(f"⚠️ Fit failed for {a}: {e}")
+                    # Add blue sample points
+                    fig.add_scatter(
+                        x=np.log10(conc_pred),
+                        y=y_samples[mask_s],
+                        mode="markers",
+                        name="Samples",
+                        marker=dict(color="blue", size=6)
+                    )
+                except Exception as e:
+                    samples[f"{a}_conc_pgml"] = np.nan
+                    st.warning(f"⚠️ Interpolation failed for {a}: {e}")
 
-st.success("✅ Curve fitting complete.")
-for fig in plots:
-    st.plotly_chart(fig, use_container_width=True)
+                if r2 < 0.95:
+                    st.warning(f"⚠️ {a}: R²={r2:.3f}, curve may be poor.")
+                plots.append(fig)
+            except Exception as e:
+                st.warning(f"⚠️ Fit failed for {a}: {e}")
+
+        st.success("✅ Curve fitting complete.")
+        for fig in plots:
+            st.plotly_chart(fig, use_container_width=True)
 
         # ---------- 8. Export ----------
         st.markdown("### Export results")
@@ -225,4 +221,3 @@ for fig in plots:
         )
 else:
     st.info("Please upload a FlowJo export to begin.")
-
